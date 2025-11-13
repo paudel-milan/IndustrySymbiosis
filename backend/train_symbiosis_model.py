@@ -21,6 +21,9 @@ from sklearn.metrics import r2_score, mean_absolute_error, accuracy_score
 import joblib
 import os
 
+models_dir = os.path.join(os.path.dirname(__file__), 'models')
+os.makedirs(models_dir, exist_ok=True)
+
 # ---------- Helper data structure (a little different from typical pipelines) ----------
 PreprocessingMeta = namedtuple("PreprocessingMeta",
                                ["num_medians", "cat_modes", "cat_values_map", "selected_features", "categorical_features"])
@@ -175,6 +178,63 @@ def train_and_save(df: pd.DataFrame, selected_features: List[str], reg_target: s
 
     reg.fit(X_tr, ytr_reg)
     clf.fit(X_tr, ytr_clf)
+    
+    
+    # ---------- DASHBOARD ARTIFACTS ----------
+
+# 1) Save model feature importances (model-level)
+    global_importances = dict(zip(selected_features, reg.feature_importances_.tolist()))
+    with open(os.path.join(models_dir, f"{out_prefix}_global_importances.json"), "w") as fh:
+        json.dump(global_importances, fh, indent=2)
+
+    # 2) Save per-feature histograms (for simple distributions on frontend)
+    # We'll compute histogram bins + counts for numeric features in selected_features
+    feature_hist = {}
+    for idx, feat in enumerate(selected_features):
+        col_vals = X_df[feat].dropna().astype(float).values
+        if col_vals.size > 0:
+            counts, bins = np.histogram(col_vals, bins=10)
+            feature_hist[feat] = {
+                "bins": bins.tolist(),    # length 11
+                "counts": counts.tolist() # length 10
+            }
+        else:
+            feature_hist[feat] = {"bins": [], "counts": []}
+
+    with open(os.path.join(models_dir, f"{out_prefix}_feature_histograms.json"), "w") as fh:
+        json.dump(feature_hist, fh, indent=2)
+
+    # 3) Compute & save global mean |SHAP| for each feature (uses background X_tr sample)
+    try:
+        import shap
+        # use a small sample for SHAP global estimation (you already saved shap_background)
+        bg_sample_size = min(200, X_tr.shape[0])
+        sample_idx = np.random.choice(X_tr.shape[0], bg_sample_size, replace=False)
+        sample_X = X_tr[sample_idx]
+
+        explainer_local = shap.TreeExplainer(reg)
+        shap_vals = explainer_local.shap_values(sample_X)
+        # shap_vals may be list or array; handle regressor common case
+        shap_arr = np.array(shap_vals[0]) if isinstance(shap_vals, list) else np.array(shap_vals)
+        # shap_arr shape: (n_samples, n_features)
+        mean_abs_shap = np.mean(np.abs(shap_arr), axis=0).tolist()
+        shap_global = dict(zip(selected_features, mean_abs_shap))
+        with open(os.path.join(models_dir, f"{out_prefix}_shap_global_abs.json"), "w") as fh:
+            json.dump(shap_global, fh, indent=2)
+        print(f"[train_and_save] saved shap_global_abs to {models_dir}")
+    except Exception as e:
+        print("[train_and_save] Could not compute/save SHAP global:", e)
+    # ---------- END DASHBOARD ARTIFACTS ----------
+
+    
+    bg_sample_size = min(100, X_tr.shape[0])
+    bg_indices = np.random.choice(X_tr.shape[0], bg_sample_size, replace=False)
+    shap_background = X_tr[bg_indices]
+
+    # save background
+    shap_bg_path = os.path.join(models_dir, f"{out_prefix}_shap_background.npy")
+    np.save(shap_bg_path, shap_background)
+    print(f"[train_and_save] saved shap background to {shap_bg_path}")
 
     # metrics
     reg_pred = reg.predict(X_val)
@@ -183,9 +243,6 @@ def train_and_save(df: pd.DataFrame, selected_features: List[str], reg_target: s
     print(f"[train_and_save] clf accuracy: {accuracy_score(yval_clf, clf_pred):.4f}")
 
     # persistence
-    import os
-    models_dir = os.path.join(os.path.dirname(__file__), 'models')
-    os.makedirs(models_dir, exist_ok=True)
     joblib.dump(reg, os.path.join(models_dir, f"{out_prefix}_regressor.joblib"))
     joblib.dump(clf, os.path.join(models_dir, f"{out_prefix}_classifier.joblib"))
     joblib.dump(meta, os.path.join(models_dir, f"{out_prefix}_preproc_meta.joblib"))
